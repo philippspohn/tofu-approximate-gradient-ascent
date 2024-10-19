@@ -52,6 +52,123 @@ class CustomTrainerForgetting(Trainer):
         if self.loss_type == "KL":
             self.oracle_model = self.e_prepare_deepspeed(self.oracle_model)
 
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        """
+        Perform a training step on a batch of inputs.
+
+        Subclass and override to inject custom behavior.
+
+        Args:
+            model (`nn.Module`):
+                The model to train.
+            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument `labels`. Check your model's documentation for all accepted arguments.
+
+        Return:
+            `torch.Tensor`: The tensor with training loss on this batch.
+        """
+        model.train()
+        if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+            self.optimizer.train()
+
+        inputs = self._prepare_inputs(inputs)
+        # if is_sagemaker_mp_enabled():
+        #     loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+        #     return loss_mb.reduce_mean().detach().to(self.args.device)
+
+
+        if self.loss_type == "approximate_grad_ascent":
+            loss, loss_prime = self._approximate_grad_ascent_step(model, inputs)
+            return loss.detach() / self.args.gradient_accumulation_steps
+        else:
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs)
+
+        del inputs
+        if (
+            self.args.torch_empty_cache_steps is not None
+            and self.state.global_step % self.args.torch_empty_cache_steps == 0
+        ):
+            if is_torch_xpu_available():
+                torch.xpu.empty_cache()
+            elif is_torch_mlu_available():
+                torch.mlu.empty_cache()
+            elif is_torch_musa_available():
+                torch.musa.empty_cache()
+            elif is_torch_npu_available():
+                torch.npu.empty_cache()
+            elif is_torch_mps_available(min_version="2.0"):
+                torch.mps.empty_cache()
+            else:
+                torch.cuda.empty_cache()
+
+        kwargs = {}
+
+        # For LOMO optimizers you need to explicitly use the learnign rate
+        if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
+            kwargs["learning_rate"] = self._get_learning_rate()
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+        if self.use_apex:
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            self.accelerator.backward(loss, **kwargs)
+
+        return loss.detach() / self.args.gradient_accumulation_steps
+
+
+    def _approximate_grad_ascent_step(self, model, inputs):
+        forget_inputs, retain_inputs = inputs
+        input_ids, labels, attention_mask = forget_inputs
+
+        # Step 1: Regular gradient ascent
+        outputs = model(input_ids, labels=labels, attention_mask=attention_mask)
+        forget_loss = outputs.loss * -1  # Negative for ascent
+
+        if self.use_apex:
+            with amp.scale_loss(forget_loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            self.accelerator.backward(forget_loss)
+
+        # Create a copy of the model with updated parameters
+        model_prime = copy.deepcopy(model)
+        with torch.no_grad():
+            for param, param_prime in zip(model.parameters(), model_prime.parameters()):
+                if param.grad is not None:
+                    param_prime.data = param.data + self.lr * param.grad
+
+        # Clear gradients for the original model
+        model.zero_grad()
+
+        # Step 2: Compute gradients at Phi'
+        outputs_prime = model_prime(input_ids, labels=labels, attention_mask=attention_mask)
+        forget_loss_prime = outputs_prime.loss * -1  # Negative for ascent
+
+        if self.use_apex:
+            with amp.scale_loss(forget_loss_prime, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            self.accelerator.backward(forget_loss_prime)
+
+        # Copy gradients from model_prime to model
+        with torch.no_grad():
+            for param, param_prime in zip(model.parameters(), model_prime.parameters()):
+                if param.grad is not None:
+                    param.grad.add_(param_prime.grad)
+
+        del model_prime
+
+        return forget_loss, forget_loss_prime
+
+
+
     def e_prepare_deepspeed(self, model):
         # Adapted from accelerate: https://github.com/huggingface/accelerate/blob/739b135f8367becb67ffaada12fe76e3aa60fefd/src/accelerate/accelerator.py#L1473
         deepspeed_plugin = self.accelerator.state.deepspeed_plugin
