@@ -52,7 +52,7 @@ class CustomTrainerForgetting(Trainer):
         if self.loss_type == "KL":
             self.oracle_model = self.e_prepare_deepspeed(self.oracle_model)
 
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+    def training_step(self, model, inputs):
         """
         Perform a training step on a batch of inputs.
 
