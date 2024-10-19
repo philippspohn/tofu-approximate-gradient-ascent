@@ -1,9 +1,13 @@
 import torch
 from torch import nn
-from transformers import Trainer
+from transformers import Trainer, is_torch_xpu_available, is_torch_mlu_available, is_torch_npu_available, \
+    is_apex_available
 import torch.nn.functional as F
 import copy, os
 import deepspeed
+from transformers.training_args import OptimizerNames
+from transformers.utils import is_torch_mps_available
+
 from evaluate_util import get_dataloader, get_all_evals
 import copy
 import json 
@@ -39,7 +43,7 @@ class CustomTrainer(Trainer):
             logits = outputs.logits
             loss = outputs.loss
         return (loss, logits, labels)
-    
+
 
 
 class CustomTrainerForgetting(Trainer):
@@ -96,8 +100,6 @@ class CustomTrainerForgetting(Trainer):
                 torch.xpu.empty_cache()
             elif is_torch_mlu_available():
                 torch.mlu.empty_cache()
-            elif is_torch_musa_available():
-                torch.musa.empty_cache()
             elif is_torch_npu_available():
                 torch.npu.empty_cache()
             elif is_torch_mps_available(min_version="2.0"):
@@ -115,6 +117,7 @@ class CustomTrainerForgetting(Trainer):
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
         if self.use_apex:
+            from apex import amp
             with amp.scale_loss(loss, self.optimizer) as scaled_loss:
                 scaled_loss.backward()
         else:
@@ -152,6 +155,7 @@ class CustomTrainerForgetting(Trainer):
         forget_loss_prime = outputs_prime.loss * -1  # Negative for ascent
 
         if self.use_apex:
+            from apex import amp
             with amp.scale_loss(forget_loss_prime, self.optimizer) as scaled_loss:
                 scaled_loss.backward()
         else:
